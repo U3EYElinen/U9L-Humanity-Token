@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/*
+  U9L Humanity Token (full contract)
+  - ERC20 base (OpenZeppelin)
+  - Auto-liquidity (swap & add)
+  - Multi-fee distribution (liquidity, treasury, burn, UBI, BTC stab, carbon, AI)
+  - UBI distribution + claim
+  - BTC price feed (Chainlink) for governance/stabilization
+  - AI governance (momentum-based fee adjustments)
+  - _update override to integrate logic into OpenZeppelin ERC20 transfer flow
+*/
+
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
@@ -24,7 +35,7 @@ interface IDEXRouter {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external returns (uint256[] memory amounts);
+    ) external;
 }
 
 interface IUniswapV2Factory {
@@ -34,26 +45,26 @@ interface IUniswapV2Factory {
 contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // ======================== VISION CONSTANTS ========================
-    string public constant VISION = "A self-sustaining economic system for all humanity";
-    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 1e18; // 1B tokens
-    uint256 public constant INITIAL_MINT = 100_000_000 * 1e18; // 10% to treasury
-    uint256 public constant BTC_TARGET_PRICE = 50_000 * 1e8; // $50,000 BTC target
+    // ================== CONSTANTS ==================
+    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 1e18;
+    uint256 public constant INITIAL_MINT = 100_000_000 * 1e18;
+    uint256 public constant BTC_TARGET_PRICE = 50_000 * 1e8; // Chainlink has 8 decimals for BTC/USD
     uint256 public constant UBI_DISTRIBUTION_CYCLE = 1 days;
 
-    // ======================== ECONOMIC ENGINE ========================
-    struct EconomicParameters {
-        uint256 liquidityFee;       
-        uint256 treasuryFee;        
-        uint256 burnFee;            
-        uint256 ubiFee;             
+    // ================== ECONOMIC PARAMETERS ==================
+    struct EconomicParams {
+        uint256 liquidityFee;        // basis points out of 1000 (e.g., 300 => 3%)
+        uint256 treasuryFee;
+        uint256 burnFee;
+        uint256 ubiFee;
         uint256 btcStabilizationFee;
-        uint256 carbonOffsetFee;    
-        uint256 aiReserveFee;       
+        uint256 carbonOffsetFee;
+        uint256 aiReserveFee;
         uint256 totalFee;
     }
+    EconomicParams public economicParams;
 
-    // ======================== STATE VARIABLES ========================
+    // ================== STATE VARIABLES ==================
     IDEXRouter public immutable router;
     IUniswapV2Factory public immutable factory;
     AggregatorV3Interface public immutable btcPriceFeed;
@@ -61,47 +72,40 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     address public immutable treasuryWallet;
     address public immutable carbonOffsetWallet;
 
-    EconomicParameters public economicParams;
     uint256 public btcPriceUpdateThreshold = 1 hours;
     uint256 public lastBTCPrice;
     uint256 public lastBTCTimestamp;
-    uint256 public stabilizationReserve;
+    uint256 public stabilizationReserve; // tokens reserved for stabilization and liquidity
+    uint256 public rewardsPool;          // UBI / reward pool
     uint256 public ubiLastDistributed;
     uint256 public totalUBIDistributed;
 
-    uint256 public swapThreshold = 50_000 * 1e18; // 50K tokens
+    uint256 public swapThreshold = 50_000 * 1e18;
     uint256 public lastLiquifyTimestamp;
     bool public liquidityLocked;
     address public liquidityPool;
 
-    uint256 public rewardsPool;
+    int256 public priceMomentum;
+    uint256 public lastAICheck;
+    bool public tradingEnabled;
+    bool private inSwap;
+
+    mapping(address => bool) public isExcludedFromFees;
     mapping(address => uint256) public holderRewards;
     mapping(address => uint256) public lastHolderBalance;
-
     mapping(address => uint256) public ubiClaims;
-    uint256 public ubiPerHolder = 100 * 1e18; 
-    uint256 public minHoldForUBI = 1000 * 1e18;
 
-    int256 public priceMomentum; 
-    uint256 public lastAICheck;
+    uint256 public ubiPerHolder = 100 * 1e18;   // example: 100 U9L per distribution
+    uint256 public minHoldForUBI = 1000 * 1e18; // requires holding ≥1000 U9L to claim
 
-    bool public tradingEnabled;
-    bool public inSwap;
-    mapping(address => bool) public isExcludedFromFees;
-
-    // ======================== EVENTS ========================
+    // ================== EVENTS ==================
     event UBIClaimed(address indexed holder, uint256 amount);
     event AutoLiquify(uint256 tokensSwapped, uint256 ethReceived, uint256 liquidityAdded);
-    event BTCStabilization(uint256 btcPrice, uint256 adjustmentAmount, bool isMint);
-    event CarbonOffset(uint256 amount, uint256 equivalentCO2);
+    event CarbonOffset(uint256 amount);
+    event BTCStabilization(uint256 btcPrice, uint256 amount, bool isMint);
     event AIGovernanceAction(string action, uint256 value);
 
-    // ======================== MODIFIERS ========================
-    modifier onlyWhenTradingEnabled() {
-        require(tradingEnabled, "Trading not enabled yet");
-        _;
-    }
-
+    // ================== MODIFIERS ==================
     modifier lockTheSwap() {
         require(!inSwap, "Swap in progress");
         inSwap = true;
@@ -109,102 +113,146 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         inSwap = false;
     }
 
-    // ======================== CONSTRUCTOR ========================
+    // ================== CONSTRUCTOR ==================
     constructor(
-        address _router,
-        address _factory,
-        address _btcPriceFeed,
-        address _weth,
-        address _treasuryWallet,
-        address _carbonOffsetWallet
-    ) ERC20("U9L Humanity Token", "U9L") ERC20Permit("U9L Humanity Token") {
-        require(_router != address(0), "Invalid router");
-        require(_factory != address(0), "Invalid factory");
-        require(_btcPriceFeed != address(0), "Invalid BTC feed");
-        require(_weth != address(0), "Invalid WETH");
-        require(_treasuryWallet != address(0), "Invalid treasury");
-        require(_carbonOffsetWallet != address(0), "Invalid carbon wallet");
+    address _router,
+    address _factory,
+    address _btcPriceFeed,
+    address _weth,
+    address _treasuryWallet,
+    address _carbonOffsetWallet
+) ERC20("U9L Humanity Token", "U9L") ERC20Permit("U9L Humanity Token") Ownable(msg.sender) {
+    // <-- All assignments MUST be here -->
+    router = IDEXRouter(_router);
+    factory = IUniswapV2Factory(_factory);
+    btcPriceFeed = AggregatorV3Interface(_btcPriceFeed);
+    WETH = _weth;
+    treasuryWallet = _treasuryWallet;
+    carbonOffsetWallet = _carbonOffsetWallet;
 
-        router = IDEXRouter(_router);
-        factory = IUniswapV2Factory(_factory);
-        btcPriceFeed = AggregatorV3Interface(_btcPriceFeed);
-        WETH = _weth;
-        treasuryWallet = _treasuryWallet;
-        carbonOffsetWallet = _carbonOffsetWallet;
+    economicParams = EconomicParams({
+        liquidityFee: 300,
+        treasuryFee: 200,
+        burnFee: 100,
+        ubiFee: 200,
+        btcStabilizationFee: 200,
+        carbonOffsetFee: 50,
+        aiReserveFee: 50,
+        totalFee: 1100
+    });
 
-        economicParams = EconomicParameters({
-            liquidityFee: 300,
-            treasuryFee: 200,
-            burnFee: 100,
-            ubiFee: 200,
-            btcStabilizationFee: 200,
-            carbonOffsetFee: 50,
-            aiReserveFee: 50,
-            totalFee: 1000
-        });
+    _mint(treasuryWallet, INITIAL_MINT);
+    isExcludedFromFees[address(this)] = true;
+    isExcludedFromFees[treasuryWallet] = true;
+    isExcludedFromFees[carbonOffsetWallet] = true;
 
-        _mint(treasuryWallet, INITIAL_MINT);
+    (, int256 btcPrice, , , ) = btcPriceFeed.latestRoundData();
+    lastBTCPrice = uint256(btcPrice);
+    lastBTCTimestamp = block.timestamp;
+}
 
-        isExcludedFromFees[address(this)] = true;
-        isExcludedFromFees[treasuryWallet] = true;
-        isExcludedFromFees[carbonOffsetWallet] = true;
-
-        (, int256 btcPrice, , , ) = btcPriceFeed.latestRoundData();
-        lastBTCPrice = uint256(btcPrice);
-        lastBTCTimestamp = block.timestamp;
-    }
-
-    // ======================== CORE TOKEN FUNCTIONS ========================
-    function _update(address from, address to, uint256 amount) internal override {
-        if (from != address(0)) lastHolderBalance[from] = balanceOf(from);
-        if (to != address(0)) lastHolderBalance[to] = balanceOf(to);
-        super._update(from, to, amount);
-    }
-
-    function _transfer(address sender, address recipient, uint256 amount) internal override onlyWhenTradingEnabled nonReentrant {
-        if (!isExcludedFromFees[sender] && !isExcludedFromFees[recipient]) {
-            uint256 fees = (amount * economicParams.totalFee) / 1000;
-            amount -= fees;
-            _distributeFees(sender, fees);
+    // ================== INTERNAL TRANSFER HOOK (_update) ==================
+    // We override _update (OpenZeppelin ERC20 internal hook) so mint/burn still work,
+    // and to integrate fees, auto-liquify, UBI and AI governance.
+    function _update(
+        address from,
+        address to,
+        uint256 value
+    ) internal virtual override {
+        // Allow minting/burning (from==0 or to==0) regardless of tradingEnabled.
+        // For normal transfers, require tradingEnabled.
+        if (from != address(0) && to != address(0)) {
+            require(tradingEnabled, "Trading not enabled");
         }
 
-        super._transfer(sender, recipient, amount);
+        // Apply fees only on normal transfers (not mint/burn) and only if not excluded
+        uint256 transferAmount = value;
+        if (from != address(0) && to != address(0) && !isExcludedFromFees[from] && !isExcludedFromFees[to]) {
+            uint256 fees = (value * economicParams.totalFee) / 1000; // totalFee is in per mille (‰)
+            transferAmount = value - fees;
+            _distributeFees(from, fees);
+        }
 
-        if (!inSwap && !liquidityLocked && balanceOf(address(this)) >= swapThreshold && block.timestamp > lastLiquifyTimestamp + 6 hours) {
+        // Perform the token movement / mint / burn using base implementation
+        super._update(from, to, transferAmount);
+
+        // Auto-liquify and other periodic actions only for normal transfers and not contract internal ops
+        if (
+            from != address(0) &&
+            to != address(0) &&
+            !inSwap &&
+            from != address(this) &&
+            to != address(this) &&
+            !liquidityLocked &&
+            balanceOf(address(this)) >= swapThreshold &&
+            block.timestamp > lastLiquifyTimestamp + 6 hours
+        ) {
             lastLiquifyTimestamp = block.timestamp;
             _autoLiquify();
         }
 
-        if (block.timestamp > ubiLastDistributed + UBI_DISTRIBUTION_CYCLE) _distributeUBI();
-        if (block.timestamp > lastAICheck + 1 hours) _runAIGovernance();
+        // UBI distribution cycle
+        if (block.timestamp > ubiLastDistributed + UBI_DISTRIBUTION_CYCLE) {
+            _distributeUBI();
+        }
+
+        // AI governance check
+        if (block.timestamp > lastAICheck + 1 hours) {
+            _runAIGovernance();
+        }
+
+        // Update holder tracking for rewards (only for normal addresses)
+        if (from != address(0)) {
+            lastHolderBalance[from] = balanceOf(from);
+            _updateRewards(from);
+        }
+        if (to != address(0)) {
+            lastHolderBalance[to] = balanceOf(to);
+        }
     }
 
+    // ================== FEE DISTRIBUTION ==================
     function _distributeFees(address sender, uint256 fees) internal {
-        uint256 liquidityAmount = (fees * economicParams.liquidityFee) / economicParams.totalFee;
-        uint256 treasuryAmount = (fees * economicParams.treasuryFee) / economicParams.totalFee;
-        uint256 burnAmount = (fees * economicParams.burnFee) / economicParams.totalFee;
-        uint256 ubiAmount = (fees * economicParams.ubiFee) / economicParams.totalFee;
-        uint256 btcStabAmount = (fees * economicParams.btcStabilizationFee) / economicParams.totalFee;
-        uint256 carbonAmount = (fees * economicParams.carbonOffsetFee) / economicParams.totalFee;
-        uint256 aiAmount = (fees * economicParams.aiReserveFee) / economicParams.totalFee;
+        EconomicParams memory p = economicParams;
+
+        uint256 liquidityAmount = (fees * p.liquidityFee) / p.totalFee;
+        uint256 treasuryAmount = (fees * p.treasuryFee) / p.totalFee;
+        uint256 burnAmount = (fees * p.burnFee) / p.totalFee;
+        uint256 ubiAmount = (fees * p.ubiFee) / p.totalFee;
+        uint256 btcStabAmount = (fees * p.btcStabilizationFee) / p.totalFee;
+        uint256 carbonAmount = (fees * p.carbonOffsetFee) / p.totalFee;
+        uint256 aiAmount = (fees * p.aiReserveFee) / p.totalFee;
 
         if (liquidityAmount > 0) {
-            super._transfer(sender, address(this), liquidityAmount);
+            super._update(sender, address(this), liquidityAmount);
             stabilizationReserve += liquidityAmount;
         }
-
-        if (treasuryAmount > 0) super._transfer(sender, treasuryWallet, treasuryAmount);
-        if (burnAmount > 0) super._burn(sender, burnAmount);
-        if (ubiAmount > 0) rewardsPool += ubiAmount;
-        if (btcStabAmount > 0) stabilizationReserve += btcStabAmount;
-        if (carbonAmount > 0) {
-            super._transfer(sender, carbonOffsetWallet, carbonAmount);
-            emit CarbonOffset(carbonAmount, carbonAmount / 2);
+        if (treasuryAmount > 0) {
+            super._update(sender, treasuryWallet, treasuryAmount);
         }
-        if (aiAmount > 0) stabilizationReserve += aiAmount;
+        if (burnAmount > 0) {
+            super._update(sender, address(0), burnAmount); // burn
+        }
+        if (ubiAmount > 0) {
+            // keep UBI portion in rewardsPool (held in contract supply)
+            rewardsPool += ubiAmount;
+            super._update(sender, address(this), ubiAmount);
+        }
+        if (btcStabAmount > 0) {
+            stabilizationReserve += btcStabAmount;
+            super._update(sender, address(this), btcStabAmount);
+        }
+        if (carbonAmount > 0) {
+            super._update(sender, carbonOffsetWallet, carbonAmount);
+            emit CarbonOffset(carbonAmount);
+        }
+        if (aiAmount > 0) {
+            stabilizationReserve += aiAmount;
+            super._update(sender, address(this), aiAmount);
+        }
     }
 
-    // ======================== AUTO-LIQUIDITY ========================
+    // ================== AUTO-LIQUIDITY ==================
     function _autoLiquify() internal lockTheSwap {
         uint256 contractBalance = balanceOf(address(this));
         if (contractBalance == 0) return;
@@ -227,24 +275,25 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         }
     }
 
-    function _swapTokensForETH(uint256 tokenAmount) private nonReentrant {
-        address ;
-        path[0] = address(this);
-        path[1] = WETH;
+    function _swapTokensForETH(uint256 tokenAmount) internal {
+    address[] memory path = new address[](2);  // ✅ Declare and initialize
+    path[0] = address(this);                   // ✅ Fix octal issue
+    path[1] = WETH;
 
+    _approve(address(this), address(router), tokenAmount);
+
+    router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+        tokenAmount,
+        0,
+        path,
+        address(this),
+        block.timestamp + 300
+    );
+}
+
+    function _addLiquidity(uint256 tokenAmount, uint256 ethAmount) internal {
         _approve(address(this), address(router), tokenAmount);
 
-        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            tokenAmount,
-            0,
-            path,
-            address(this),
-            block.timestamp + 300
-        );
-    }
-
-    function _addLiquidity(uint256 tokenAmount, uint256 ethAmount) private nonReentrant {
-        _approve(address(this), address(router), tokenAmount);
         router.addLiquidityETH{value: ethAmount}(
             address(this),
             tokenAmount,
@@ -255,13 +304,18 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         );
     }
 
-    // ======================== BTC PEG ========================
+    // ================== BTC PEG STABILIZATION ==================
+    // Manual sync callable by anyone to trigger a stabilization check (owner can call too)
     function _checkBTCPeg() internal {
-        (, int256 currentBTCPrice, , uint256 updatedAt, ) = btcPriceFeed.latestRoundData();
+        (, int256 currentBTCPriceInt, , uint256 updatedAt, ) = btcPriceFeed.latestRoundData();
         require(block.timestamp - updatedAt < btcPriceUpdateThreshold, "Stale BTC price");
-        uint256 currentPrice = uint256(currentBTCPrice);
 
-        if (lastBTCPrice > 0 && (currentPrice > lastBTCPrice * 105 / 100 || currentPrice < lastBTCPrice * 95 / 100)) {
+        uint256 currentPrice = uint256(currentBTCPriceInt);
+
+        if (lastBTCPrice > 0 &&
+            (currentPrice > (lastBTCPrice * 105) / 100 ||
+             currentPrice < (lastBTCPrice * 95) / 100)) {
+
             uint256 targetSupply = (currentPrice * MAX_SUPPLY) / BTC_TARGET_PRICE;
 
             if (targetSupply > totalSupply()) {
@@ -278,119 +332,194 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
                     emit BTCStabilization(currentPrice, burnAmount, false);
                 }
             }
+
             lastBTCPrice = currentPrice;
             lastBTCTimestamp = block.timestamp;
         }
     }
 
-    // ======================== UBI ========================
+    // Exposed manual sync
+    function manualSync() external {
+        _checkBTCPeg();
+    }
+
+    // ================== UBI DISTRIBUTION ==================
     function _distributeUBI() internal {
+        if (rewardsPool == 0) return;
+
         uint256 totalUBI = (totalSupply() * ubiPerHolder) / (1000 * 1e18);
         if (totalUBI > rewardsPool / 5) totalUBI = rewardsPool / 5;
 
         if (totalUBI > 0 && rewardsPool >= totalUBI) {
             rewardsPool -= totalUBI;
             totalUBIDistributed += totalUBI;
-            emit AIGovernanceAction("UBI Distribution", totalUBI);
             ubiLastDistributed = block.timestamp;
+            emit AIGovernanceAction("UBI Distribution", totalUBI);
+            // Note: actual per-holder distribution requires iteration (gas heavy).
+            // For now, rewardsPool is reduced; holders call claimUBI() to mint themselves if eligible.
         }
     }
 
     function claimUBI() external {
-        require(balanceOf(msg.sender) >= minHoldForUBI, "Insufficient balance");
-        require(block.timestamp > ubiLastDistributed, "No UBI available");
+        require(balanceOf(msg.sender) >= minHoldForUBI, "Insufficient balance to claim UBI");
+        require(block.timestamp > ubiLastDistributed, "No UBI available right now");
 
         uint256 ubiAmount = ubiPerHolder;
         if (rewardsPool < ubiAmount) ubiAmount = rewardsPool;
-        if (ubiAmount > 0) {
-            rewardsPool -= ubiAmount;
-            _mint(msg.sender, ubiAmount);
-            ubiClaims[msg.sender] += ubiAmount;
-            emit UBIClaimed(msg.sender, ubiAmount);
-        }
+        require(ubiAmount > 0, "No UBI available");
+
+        rewardsPool -= ubiAmount;
+        _mint(msg.sender, ubiAmount);
+        ubiClaims[msg.sender] += ubiAmount;
+        emit UBIClaimed(msg.sender, ubiAmount);
     }
 
-    // ======================== AI GOVERNANCE ========================
+    // ================== AI GOVERNANCE ==================
     function _runAIGovernance() internal {
-        (, int256 currentBTCPrice, , , ) = btcPriceFeed.latestRoundData();
-        uint256 currentPrice = uint256(currentBTCPrice);
+        (, int256 currentBTCPriceInt, , , ) = btcPriceFeed.latestRoundData();
+        uint256 currentPrice = uint256(currentBTCPriceInt);
 
         if (lastBTCPrice > 0) {
-            int256 priceChange = int256(currentPrice) - int256(lastBTCPrice);
-            priceMomentum = priceMomentum * 9/10 + (priceChange * 100 / lastBTCPrice);
+            int256 change = int256(currentPrice) - int256(lastBTCPrice);
+            // momentum scaled to +/- 100-ish
+            priceMomentum = (priceMomentum * 9) / 10 + (change * 100 / int256(lastBTCPrice));
 
             if (priceMomentum > 50) economicParams.btcStabilizationFee = 300;
             else if (priceMomentum < -50) economicParams.btcStabilizationFee = 100;
             else economicParams.btcStabilizationFee = 200;
 
-            economicParams.totalFee = economicParams.liquidityFee + economicParams.treasuryFee +
-                                      economicParams.burnFee + economicParams.ubiFee +
-                                      economicParams.btcStabilizationFee +
-                                      economicParams.carbonOffsetFee +
-                                      economicParams.aiReserveFee;
+            economicParams.totalFee =
+                economicParams.liquidityFee +
+                economicParams.treasuryFee +
+                economicParams.burnFee +
+                economicParams.ubiFee +
+                economicParams.btcStabilizationFee +
+                economicParams.carbonOffsetFee +
+                economicParams.aiReserveFee;
         }
 
         lastAICheck = block.timestamp;
     }
 
-    // ======================== REWARDS ========================
+    // ================== REWARDS (simple bookkeeping) ==================
     function _updateRewards(address holder) internal {
-        if (holder != address(0) && !isExcludedFromFees[holder]) {
-            uint256 holderBalance = balanceOf(holder);
-            uint256 balanceChange = holderBalance - lastHolderBalance[holder];
-            if (balanceChange > 0 && totalSupply() > 0) {
-                holderRewards[holder] += (balanceChange * rewardsPool) / totalSupply();
-            }
-            lastHolderBalance[holder] = holderBalance;
+        if (holder == address(0) || isExcludedFromFees[holder]) return;
+        uint256 holderBalance = balanceOf(holder);
+        uint256 balanceChange = 0;
+        if (holderBalance > lastHolderBalance[holder]) balanceChange = holderBalance - lastHolderBalance[holder];
+        if (balanceChange > 0 && totalSupply() > 0) {
+            holderRewards[holder] += (balanceChange * rewardsPool) / totalSupply();
         }
+        lastHolderBalance[holder] = holderBalance;
     }
 
     function claimRewards() external {
         uint256 reward = holderRewards[msg.sender];
-        if (reward > 0) {
-            holderRewards[msg.sender] = 0;
+        require(reward > 0, "No rewards");
+        holderRewards[msg.sender] = 0;
+        // transfer from contract's balance if sufficient, otherwise mint
+        if (balanceOf(address(this)) >= reward) {
             _transfer(address(this), msg.sender, reward);
+        } else {
+            _mint(msg.sender, reward);
         }
     }
 
-    // ======================== OWNER FUNCTIONS ========================
-    function setTradingEnabled(bool enabled) external onlyOwner { tradingEnabled = enabled; }
-    function setFees(uint256 l,uint256 t,uint256 b,uint256 u,uint256 btc,uint256 c,uint256 ai) external onlyOwner {
-        require(l+t+b+u+btc+c+ai <= 1000,"Total fee too high");
-        economicParams = EconomicParameters({liquidityFee:l, treasuryFee:t, burnFee:b, ubiFee:u, btcStabilizationFee:btc, carbonOffsetFee:c, aiReserveFee:ai, totalFee:l+t+b+u+btc+c+ai});
+    // ================== OWNER FUNCTIONS ==================
+    function setTradingEnabled(bool enabled) external onlyOwner {
+        tradingEnabled = enabled;
     }
-    function setSwapThreshold(uint256 threshold) external onlyOwner { swapThreshold = threshold; }
-    function lockLiquidity(bool locked) external onlyOwner { liquidityLocked = locked; }
-    function withdrawReserve(uint256 amount) external onlyOwner {
+
+    function setFees(
+        uint256 _liquidityFee,
+        uint256 _treasuryFee,
+        uint256 _burnFee,
+        uint256 _ubiFee,
+        uint256 _btcStabFee,
+        uint256 _carbonFee,
+        uint256 _aiFee
+    ) external onlyOwner {
+        uint256 total = _liquidityFee + _treasuryFee + _burnFee + _ubiFee + _btcStabFee + _carbonFee + _aiFee;
+        require(total <= 2000, "Total fee too high"); // safety cap (20%)
+        economicParams = EconomicParams({
+            liquidityFee: _liquidityFee,
+            treasuryFee: _treasuryFee,
+            burnFee: _burnFee,
+            ubiFee: _ubiFee,
+            btcStabilizationFee: _btcStabFee,
+            carbonOffsetFee: _carbonFee,
+            aiReserveFee: _aiFee,
+            totalFee: total
+        });
+    }
+
+    function setSwapThreshold(uint256 threshold) external onlyOwner {
+        swapThreshold = threshold;
+    }
+
+    function lockLiquidity(bool locked) external onlyOwner {
+        liquidityLocked = locked;
+    }
+
+    function withdrawStabilizationReserve(uint256 amount) external onlyOwner {
         require(amount <= stabilizationReserve, "Insufficient reserve");
         stabilizationReserve -= amount;
+        // transfer tokens to owner
         _transfer(address(this), owner(), amount);
     }
-    function emergencyWithdraw() external onlyOwner {
-        uint256 ethBalance = address(this).balance;
-        if (ethBalance > 0) payable(owner()).transfer(ethBalance);
+
+    function emergencyWithdrawETH() external onlyOwner {
+        uint256 bal = address(this).balance;
+        if (bal > 0) payable(owner()).transfer(bal);
     }
 
-    // ======================== VIEW FUNCTIONS ========================
-    function getTokenomics() external view returns (uint256 currentSupply,uint256 maxSupply,uint256 btcPrice,uint256 ubiDistributed,uint256 _rewardsPool,uint256 carbonOffset,int256 _priceMomentum) {
-        return (totalSupply(),MAX_SUPPLY,lastBTCPrice,totalUBIDistributed,rewardsPool,(block.timestamp - lastBTCTimestamp)<btcPriceUpdateThreshold?lastBTCPrice:0,priceMomentum);
-    }
-    function getHolderInfo(address holder) external view returns (uint256 balance,uint256 pendingRewards,uint256 totalUBIClaimed,bool ubiEligible){
-        return (balanceOf(holder),holderRewards[holder],ubiClaims[holder],balanceOf(holder)>=minHoldForUBI);
+    // ================== VIEW HELPERS ==================
+    function getTokenomics() external view returns (
+        uint256 currentSupply,
+        uint256 maxSupply,
+        uint256 btcPrice,
+        uint256 ubiDistributed,
+        uint256 _rewardsPool,
+        uint256 stabilization,
+        int256 momentum
+    ) {
+        return (
+            totalSupply(),
+            MAX_SUPPLY,
+            lastBTCPrice,
+            totalUBIDistributed,
+            rewardsPool,
+            stabilizationReserve,
+            priceMomentum
+        );
     }
 
-    // ======================== LIFECYCLE ========================
-    function manualSync() external { _checkBTCPeg(); }
-    receive() external payable {}
+    function getHolderInfo(address holder) external view returns (
+        uint256 balance,
+        uint256 pendingRewards,
+        uint256 totalUBIClaimed,
+        bool ubiEligible
+    ) {
+        return (
+            balanceOf(holder),
+            holderRewards[holder],
+            ubiClaims[holder],
+            balanceOf(holder) >= minHoldForUBI
+        );
+    }
 
+    // ================== POOL INIT & RECEIVE ==================
+    // Owner creates pool and funds contract with tokens; owner must provide ETH when adding liquidity
     function initializePool() external onlyOwner {
         require(liquidityPool == address(0), "Already initialized");
-        _approve(address(this), address(router), type(uint256).max);
         liquidityPool = factory.createPair(address(this), WETH);
         isExcludedFromFees[liquidityPool] = true;
 
         uint256 initialLiquidity = 100_000 * 1e18;
         _mint(address(this), initialLiquidity);
         _approve(address(this), address(router), initialLiquidity);
+        // Owner must send ETH and call router.addLiquidityETH via external transaction if desired
     }
+
+    receive() external payable {}
 }
