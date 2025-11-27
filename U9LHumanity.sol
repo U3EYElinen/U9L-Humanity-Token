@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.30;
 
 /*
-  U9L Humanity Token (full contract)
-  - ERC20 base (OpenZeppelin)
+  U9L Humanity Token (ETH-stabilized version for Polygon)
+  - Total supply: 14,400,000,000 U9L (minted to deployer)
+  - Tradable immediately upon deployment
   - Auto-liquidity (swap & add)
-  - Multi-fee distribution (liquidity, treasury, burn, UBI, BTC stab, carbon, AI)
+  - Multi-fee distribution (liquidity, treasury, burn, UBI, ETH stab, carbon, AI)
   - UBI distribution + claim
-  - BTC price feed (Chainlink) for governance/stabilization
-  - AI governance (momentum-based fee adjustments)
-  - _update override to integrate logic into OpenZeppelin ERC20 transfer flow
+  - ETH price feed (Chainlink) for governance/stabilization (Polygon ETH/USD feed)
+  - AI governance (momentum-based fee adjustments using ETH price)
+  - _update override integrates logic into OpenZeppelin ERC20 transfer flow
 */
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -46,18 +47,19 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ================== CONSTANTS ==================
-    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 1e18;
-    uint256 public constant INITIAL_MINT = 100_000_000 * 1e18;
-    uint256 public constant BTC_TARGET_PRICE = 50_000 * 1e8; // Chainlink has 8 decimals for BTC/USD
+    uint256 public constant MAX_SUPPLY = 14_400_000_000 * 1e18; // 14.4B
+    uint256 public constant INITIAL_MINT = MAX_SUPPLY;         // mint full supply to deployer
+    // Chainlink ETH/USD has 8 decimals on most feeds; target = $3,500 => 3500 * 1e8
+    uint256 public constant ETH_TARGET_PRICE = 3500 * 1e8;
     uint256 public constant UBI_DISTRIBUTION_CYCLE = 1 days;
 
     // ================== ECONOMIC PARAMETERS ==================
     struct EconomicParams {
-        uint256 liquidityFee;        // basis points out of 1000 (e.g., 300 => 3%)
+        uint256 liquidityFee;        // per-mille (‰) parts (e.g., 300 => 3.00%)
         uint256 treasuryFee;
         uint256 burnFee;
         uint256 ubiFee;
-        uint256 btcStabilizationFee;
+        uint256 ethStabilizationFee;
         uint256 carbonOffsetFee;
         uint256 aiReserveFee;
         uint256 totalFee;
@@ -67,14 +69,14 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     // ================== STATE VARIABLES ==================
     IDEXRouter public immutable router;
     IUniswapV2Factory public immutable factory;
-    AggregatorV3Interface public immutable btcPriceFeed;
+    AggregatorV3Interface public immutable ethPriceFeed;
     address public immutable WETH;
     address public immutable treasuryWallet;
     address public immutable carbonOffsetWallet;
 
-    uint256 public btcPriceUpdateThreshold = 1 hours;
-    uint256 public lastBTCPrice;
-    uint256 public lastBTCTimestamp;
+    uint256 public ethPriceUpdateThreshold = 1 hours;
+    uint256 public lastETHPrice;
+    uint256 public lastETHTimestamp;
     uint256 public stabilizationReserve; // tokens reserved for stabilization and liquidity
     uint256 public rewardsPool;          // UBI / reward pool
     uint256 public ubiLastDistributed;
@@ -102,7 +104,7 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     event UBIClaimed(address indexed holder, uint256 amount);
     event AutoLiquify(uint256 tokensSwapped, uint256 ethReceived, uint256 liquidityAdded);
     event CarbonOffset(uint256 amount);
-    event BTCStabilization(uint256 btcPrice, uint256 amount, bool isMint);
+    event ETHStabilization(uint256 ethPrice, uint256 amount, bool isMint);
     event AIGovernanceAction(string action, uint256 value);
 
     // ================== MODIFIERS ==================
@@ -114,18 +116,27 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     }
 
     // ================== CONSTRUCTOR ==================
+    // Note (Polygon): ETH/USD Chainlink feed (Polygon) example:
+    // 0x327e23A4855b6F663a28c5161541d69Af8973302
+
     constructor(
     address _router,
     address _factory,
-    address _btcPriceFeed,
+    address _ethPriceFeed,
     address _weth,
     address _treasuryWallet,
     address _carbonOffsetWallet
-) ERC20("U9L Humanity Token", "U9L") ERC20Permit("U9L Humanity Token") Ownable(msg.sender) {
-    // <-- All assignments MUST be here -->
+) ERC20("U9L Humanity Token", "U9L") ERC20Permit("U9L Humanity Token") Ownable(msg.sender) ReentrancyGuard() {
+    require(_router != address(0), "Invalid router");
+    require(_factory != address(0), "Invalid factory");
+    require(_ethPriceFeed != address(0), "Invalid ETH feed");
+    require(_weth != address(0), "Invalid WETH");
+    require(_treasuryWallet != address(0), "Invalid treasury");
+    require(_carbonOffsetWallet != address(0), "Invalid carbon wallet");
+
     router = IDEXRouter(_router);
     factory = IUniswapV2Factory(_factory);
-    btcPriceFeed = AggregatorV3Interface(_btcPriceFeed);
+    ethPriceFeed = AggregatorV3Interface(_ethPriceFeed);
     WETH = _weth;
     treasuryWallet = _treasuryWallet;
     carbonOffsetWallet = _carbonOffsetWallet;
@@ -135,32 +146,33 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         treasuryFee: 200,
         burnFee: 100,
         ubiFee: 200,
-        btcStabilizationFee: 200,
+        ethStabilizationFee: 200,
         carbonOffsetFee: 50,
         aiReserveFee: 50,
         totalFee: 1100
     });
 
-    _mint(treasuryWallet, INITIAL_MINT);
+    _mint(msg.sender, INITIAL_MINT);
     isExcludedFromFees[address(this)] = true;
+    isExcludedFromFees[msg.sender] = true;
     isExcludedFromFees[treasuryWallet] = true;
     isExcludedFromFees[carbonOffsetWallet] = true;
 
-    (, int256 btcPrice, , , ) = btcPriceFeed.latestRoundData();
-    lastBTCPrice = uint256(btcPrice);
-    lastBTCTimestamp = block.timestamp;
+    (, int256 ethPrice, , , ) = ethPriceFeed.latestRoundData();
+    lastETHPrice = uint256(ethPrice);
+    lastETHTimestamp = block.timestamp;
+    tradingEnabled = true;
 }
 
     // ================== INTERNAL TRANSFER HOOK (_update) ==================
-    // We override _update (OpenZeppelin ERC20 internal hook) so mint/burn still work,
-    // and to integrate fees, auto-liquify, UBI and AI governance.
+    // Override OpenZeppelin's _update to integrate fees & on-transfer logic.
     function _update(
         address from,
         address to,
         uint256 value
     ) internal virtual override {
-        // Allow minting/burning (from==0 or to==0) regardless of tradingEnabled.
-        // For normal transfers, require tradingEnabled.
+        // Allow minting/burning (from==0 or to==0) always.
+        // For normal transfers require tradingEnabled (now true by default).
         if (from != address(0) && to != address(0)) {
             require(tradingEnabled, "Trading not enabled");
         }
@@ -168,15 +180,19 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         // Apply fees only on normal transfers (not mint/burn) and only if not excluded
         uint256 transferAmount = value;
         if (from != address(0) && to != address(0) && !isExcludedFromFees[from] && !isExcludedFromFees[to]) {
-            uint256 fees = (value * economicParams.totalFee) / 1000; // totalFee is in per mille (‰)
-            transferAmount = value - fees;
-            _distributeFees(from, fees);
+            // defensive: ensure totalFee > 0
+            uint256 totalF = economicParams.totalFee;
+            if (totalF > 0) {
+                uint256 fees = (value * totalF) / 1000;
+                transferAmount = value - fees;
+                _distributeFees(from, fees);
+            }
         }
 
         // Perform the token movement / mint / burn using base implementation
         super._update(from, to, transferAmount);
 
-        // Auto-liquify and other periodic actions only for normal transfers and not contract internal ops
+        // Auto-liquify + periodic actions only for normal transfers and not contract internal ops
         if (
             from != address(0) &&
             to != address(0) &&
@@ -214,14 +230,15 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     // ================== FEE DISTRIBUTION ==================
     function _distributeFees(address sender, uint256 fees) internal {
         EconomicParams memory p = economicParams;
+        uint256 denom = p.totalFee == 0 ? 1 : p.totalFee;
 
-        uint256 liquidityAmount = (fees * p.liquidityFee) / p.totalFee;
-        uint256 treasuryAmount = (fees * p.treasuryFee) / p.totalFee;
-        uint256 burnAmount = (fees * p.burnFee) / p.totalFee;
-        uint256 ubiAmount = (fees * p.ubiFee) / p.totalFee;
-        uint256 btcStabAmount = (fees * p.btcStabilizationFee) / p.totalFee;
-        uint256 carbonAmount = (fees * p.carbonOffsetFee) / p.totalFee;
-        uint256 aiAmount = (fees * p.aiReserveFee) / p.totalFee;
+        uint256 liquidityAmount = (fees * p.liquidityFee) / denom;
+        uint256 treasuryAmount = (fees * p.treasuryFee) / denom;
+        uint256 burnAmount = (fees * p.burnFee) / denom;
+        uint256 ubiAmount = (fees * p.ubiFee) / denom;
+        uint256 ethStabAmount = (fees * p.ethStabilizationFee) / denom;
+        uint256 carbonAmount = (fees * p.carbonOffsetFee) / denom;
+        uint256 aiAmount = (fees * p.aiReserveFee) / denom;
 
         if (liquidityAmount > 0) {
             super._update(sender, address(this), liquidityAmount);
@@ -234,13 +251,12 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
             super._update(sender, address(0), burnAmount); // burn
         }
         if (ubiAmount > 0) {
-            // keep UBI portion in rewardsPool (held in contract supply)
             rewardsPool += ubiAmount;
             super._update(sender, address(this), ubiAmount);
         }
-        if (btcStabAmount > 0) {
-            stabilizationReserve += btcStabAmount;
-            super._update(sender, address(this), btcStabAmount);
+        if (ethStabAmount > 0) {
+            stabilizationReserve += ethStabAmount;
+            super._update(sender, address(this), ethStabAmount);
         }
         if (carbonAmount > 0) {
             super._update(sender, carbonOffsetWallet, carbonAmount);
@@ -276,9 +292,9 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     }
 
     function _swapTokensForETH(uint256 tokenAmount) internal {
-    address[] memory path = new address[](2);  // ✅ Declare and initialize
-    path[0] = address(this);                   // ✅ Fix octal issue
-    path[1] = WETH;
+    address[] memory path = new address[](2); // ✅ Declare + initialize array
+    path[0] = address(this);                  // ✅ Now `path` exists
+    path[1] = WETH;                           // ✅ Assign WETH to path[1]
 
     _approve(address(this), address(router), tokenAmount);
 
@@ -304,43 +320,42 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         );
     }
 
-    // ================== BTC PEG STABILIZATION ==================
-    // Manual sync callable by anyone to trigger a stabilization check (owner can call too)
-    function _checkBTCPeg() internal {
-        (, int256 currentBTCPriceInt, , uint256 updatedAt, ) = btcPriceFeed.latestRoundData();
-        require(block.timestamp - updatedAt < btcPriceUpdateThreshold, "Stale BTC price");
+    // ================== ETH PEG STABILIZATION ==================
+    function _checkETHPeg() internal {
+        (, int256 currentETHPriceInt, , uint256 updatedAt, ) = ethPriceFeed.latestRoundData();
+        require(block.timestamp - updatedAt < ethPriceUpdateThreshold, "Stale ETH price");
 
-        uint256 currentPrice = uint256(currentBTCPriceInt);
+        uint256 currentPrice = uint256(currentETHPriceInt);
 
-        if (lastBTCPrice > 0 &&
-            (currentPrice > (lastBTCPrice * 105) / 100 ||
-             currentPrice < (lastBTCPrice * 95) / 100)) {
+        // Adjust only on significant moves (>5%)
+        if (lastETHPrice > 0 &&
+            (currentPrice > (lastETHPrice * 105) / 100 ||
+             currentPrice < (lastETHPrice * 95) / 100)) {
 
-            uint256 targetSupply = (currentPrice * MAX_SUPPLY) / BTC_TARGET_PRICE;
+            uint256 targetSupply = (currentPrice * MAX_SUPPLY) / ETH_TARGET_PRICE;
 
             if (targetSupply > totalSupply()) {
                 uint256 mintAmount = targetSupply - totalSupply();
                 if (stabilizationReserve >= mintAmount) {
                     stabilizationReserve -= mintAmount;
                     _mint(address(this), mintAmount);
-                    emit BTCStabilization(currentPrice, mintAmount, true);
+                    emit ETHStabilization(currentPrice, mintAmount, true);
                 }
             } else if (targetSupply < totalSupply()) {
                 uint256 burnAmount = totalSupply() - targetSupply;
                 if (balanceOf(address(this)) >= burnAmount) {
                     _burn(address(this), burnAmount);
-                    emit BTCStabilization(currentPrice, burnAmount, false);
+                    emit ETHStabilization(currentPrice, burnAmount, false);
                 }
             }
 
-            lastBTCPrice = currentPrice;
-            lastBTCTimestamp = block.timestamp;
+            lastETHPrice = currentPrice;
+            lastETHTimestamp = block.timestamp;
         }
     }
 
-    // Exposed manual sync
     function manualSync() external {
-        _checkBTCPeg();
+        _checkETHPeg();
     }
 
     // ================== UBI DISTRIBUTION ==================
@@ -355,8 +370,7 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
             totalUBIDistributed += totalUBI;
             ubiLastDistributed = block.timestamp;
             emit AIGovernanceAction("UBI Distribution", totalUBI);
-            // Note: actual per-holder distribution requires iteration (gas heavy).
-            // For now, rewardsPool is reduced; holders call claimUBI() to mint themselves if eligible.
+            // Holders mint via claimUBI()
         }
     }
 
@@ -376,24 +390,24 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
 
     // ================== AI GOVERNANCE ==================
     function _runAIGovernance() internal {
-        (, int256 currentBTCPriceInt, , , ) = btcPriceFeed.latestRoundData();
-        uint256 currentPrice = uint256(currentBTCPriceInt);
+        (, int256 currentETHPriceInt, , , ) = ethPriceFeed.latestRoundData();
+        uint256 currentPrice = uint256(currentETHPriceInt);
 
-        if (lastBTCPrice > 0) {
-            int256 change = int256(currentPrice) - int256(lastBTCPrice);
-            // momentum scaled to +/- 100-ish
-            priceMomentum = (priceMomentum * 9) / 10 + (change * 100 / int256(lastBTCPrice));
+        if (lastETHPrice > 0) {
+            int256 change = int256(currentPrice) - int256(lastETHPrice);
+            // momentum scaled to roughly +/-100
+            priceMomentum = (priceMomentum * 9) / 10 + (change * 100 / int256(lastETHPrice));
 
-            if (priceMomentum > 50) economicParams.btcStabilizationFee = 300;
-            else if (priceMomentum < -50) economicParams.btcStabilizationFee = 100;
-            else economicParams.btcStabilizationFee = 200;
+            if (priceMomentum > 50) economicParams.ethStabilizationFee = 300;
+            else if (priceMomentum < -50) economicParams.ethStabilizationFee = 100;
+            else economicParams.ethStabilizationFee = 200;
 
             economicParams.totalFee =
                 economicParams.liquidityFee +
                 economicParams.treasuryFee +
                 economicParams.burnFee +
                 economicParams.ubiFee +
-                economicParams.btcStabilizationFee +
+                economicParams.ethStabilizationFee +
                 economicParams.carbonOffsetFee +
                 economicParams.aiReserveFee;
         }
@@ -417,7 +431,6 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         uint256 reward = holderRewards[msg.sender];
         require(reward > 0, "No rewards");
         holderRewards[msg.sender] = 0;
-        // transfer from contract's balance if sufficient, otherwise mint
         if (balanceOf(address(this)) >= reward) {
             _transfer(address(this), msg.sender, reward);
         } else {
@@ -435,18 +448,18 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         uint256 _treasuryFee,
         uint256 _burnFee,
         uint256 _ubiFee,
-        uint256 _btcStabFee,
+        uint256 _ethStabFee,
         uint256 _carbonFee,
         uint256 _aiFee
     ) external onlyOwner {
-        uint256 total = _liquidityFee + _treasuryFee + _burnFee + _ubiFee + _btcStabFee + _carbonFee + _aiFee;
+        uint256 total = _liquidityFee + _treasuryFee + _burnFee + _ubiFee + _ethStabFee + _carbonFee + _aiFee;
         require(total <= 2000, "Total fee too high"); // safety cap (20%)
         economicParams = EconomicParams({
             liquidityFee: _liquidityFee,
             treasuryFee: _treasuryFee,
             burnFee: _burnFee,
             ubiFee: _ubiFee,
-            btcStabilizationFee: _btcStabFee,
+            ethStabilizationFee: _ethStabFee,
             carbonOffsetFee: _carbonFee,
             aiReserveFee: _aiFee,
             totalFee: total
@@ -464,7 +477,6 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     function withdrawStabilizationReserve(uint256 amount) external onlyOwner {
         require(amount <= stabilizationReserve, "Insufficient reserve");
         stabilizationReserve -= amount;
-        // transfer tokens to owner
         _transfer(address(this), owner(), amount);
     }
 
@@ -477,7 +489,7 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     function getTokenomics() external view returns (
         uint256 currentSupply,
         uint256 maxSupply,
-        uint256 btcPrice,
+        uint256 ethPrice,
         uint256 ubiDistributed,
         uint256 _rewardsPool,
         uint256 stabilization,
@@ -486,7 +498,7 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
         return (
             totalSupply(),
             MAX_SUPPLY,
-            lastBTCPrice,
+            lastETHPrice,
             totalUBIDistributed,
             rewardsPool,
             stabilizationReserve,
@@ -509,7 +521,6 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     }
 
     // ================== POOL INIT & RECEIVE ==================
-    // Owner creates pool and funds contract with tokens; owner must provide ETH when adding liquidity
     function initializePool() external onlyOwner {
         require(liquidityPool == address(0), "Already initialized");
         liquidityPool = factory.createPair(address(this), WETH);
