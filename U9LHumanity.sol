@@ -127,12 +127,12 @@ contract U9LHumanity is ERC20, ERC20Permit, Ownable, ReentrancyGuard {
     address _treasuryWallet,
     address _carbonOffsetWallet
 ) ERC20("U9L Humanity Token", "U9L") ERC20Permit("U9L Humanity Token") Ownable(msg.sender) ReentrancyGuard() {
-    require(_router != address(0), "Invalid router");
-    require(_factory != address(0), "Invalid factory");
-    require(_ethPriceFeed != address(0), "Invalid ETH feed");
-    require(_weth != address(0), "Invalid WETH");
-    require(_treasuryWallet != address(0), "Invalid treasury");
-    require(_carbonOffsetWallet != address(0), "Invalid carbon wallet");
+    require(_router != address(0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff), "Invalid router");
+    require(_factory != address(0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32), "Invalid factory");
+    require(_ethPriceFeed != address(0x327e23A4855b6F663a28c5161541d69Af8973302), "Invalid ETH feed");
+    require(_weth != address(0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619), "Invalid WETH");
+    require(_treasuryWallet != address(0x63FBA3996c7C89a9a1922373e7382FcB8Ce8EBaA), "Invalid treasury");
+    require(_carbonOffsetWallet != address(0x63FBA3996c7C89a9a1922373e7382FcB8Ce8EBaA), "Invalid carbon wallet");
 
     router = IDEXRouter(_router);
     factory = IUniswapV2Factory(_factory);
